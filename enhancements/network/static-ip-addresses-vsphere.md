@@ -73,9 +73,7 @@ slice will be introduced to the installer platform specification to allow networ
 For the bootstrap and control plane nodes, static IP configuration is passed to the node on the [kernel command line](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/networking_guide/sec-configuring_ip_networking_from_the_kernel_command_line) via the `guestinfo.afterburn.initrd.network-kargs` extraconfig parameter.  [Afterburn](https://github.com/coreos/afterburn/blob/main/src/providers/vmware/amd64.rs) recognizes this parameter when the node initially boots. 
 
 When static network device configuration is required, Machines can not be created via MachineSets.
-The installer must create the initial set of compute Machines manually and an administrator
-must implement a `preProvision` hook for the MachineSet to allow the MachineSet to create
-Machines during day-2 operations. See [network device configuration of Machines](#Scaling-new-Nodes-with-`machinesets`) for more information.
+The installer must create the initial set of compute machines.
 
 As with the installer, the vSphere [machine reconciler](https://github.com/openshift/machine-api-operator/blob/master/pkg/controller/vsphere/reconciler.go#L745-L755) 
 will pass the static network device configuration via the `guestinfo.afterburn.initrd.network-kargs` extraconfig parameter.  
@@ -83,7 +81,7 @@ will pass the static network device configuration via the `guestinfo.afterburn.i
 
 ### Day 2 Static network device configuration
 
-Nodes being added to a cluster may be configured with an network device configuration or default to DHCP.  The networking configuration of a node/machine is immutable after creation. The vSphere machine API machine controller will apply the network device configuration when the associated VM is cloned.
+Nodes being added to a cluster may be configured with a network device configuration or default to DHCP.  The networking configuration of a node/machine is immutable after creation. The vSphere machine API machine controller will apply the network device configuration when the associated VM is cloned.
 
 `machinesets` will be supported through the creation of a user-created custom controller([sample controller](https://github.com/rvanderp3/machine-ipam-controller)).  This custom controller will leverage machine lifecycle hooks to
 provide network device configuration to machines descending from `machinesets` with `machine` annotated with the appropriate lifecycle hook.
@@ -113,6 +111,47 @@ type Host struct {
   Role string `json: "role"`
 }
 
+// IPAMClusterIPPoolSpec defines the desired state of IPAMClusterIPPoolSpec.
+type IPAMClusterIPPoolSpec struct {
+	// Subnet is the subnet to assign IP addresses from.
+	// +optional
+	Subnet string `json:"subnet,omitempty"`
+
+  FailureDomain string `json:"failure-domain,omitempty"`
+}
+
+// IPAMClusterIPPoolStatus defines the observed state of StubClusterIPPool.
+type IPAMClusterIPPoolStatus struct {
+}
+
+// IPAMClusterIPPool is the Schema for the StubClusterIPPool API.
+type IPAMClusterIPPool struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+  Spec   IPAMClusterIPPoolSpec   `json:"spec,omitempty"`
+	Status IPAMClusterIPPoolStatus `json:"status,omitempty"`
+}
+
+
+// AddressesFromPool is an IPAddressPool that should be assigned to
+// IPAddressClaims. The machine's cloud-init metadata will be populated with
+// IPAddresses fulfilled by an IPAM provider.
+type AddressesFromPool struct {  
+  // APIGroup is the group for the resource
+  // being referenced. If APIGroup is not
+  // specified, the specified Kind must be in
+  // the core API group. For any other
+  // third-party types, APIGroup is required.
+  ApiGroup string `json: "apiGroup"`
+  
+  // Kind is the type of resource being referenced
+  Kind string `json: "kind"` 
+  
+  // Name is the name of resource being referenced
+  Name string `json: "name"` 
+}
+
 type NetworkDeviceSpec struct {
 	// gateway4 is the IPv4 gateway used by this device.
 	// Required when DHCP4 is false.
@@ -138,6 +177,9 @@ type NetworkDeviceSpec struct {
 	// Please note that Linux allows only three nameservers (https://linux.die.net/man/5/resolv.conf).
 	// +optional
 	Nameservers []string `json:"nameservers,omitempty"`
+  
+  // addressesFromPools is a list of address pools which will fulfill requests for static IPs
+  AddressesFromPools []AddressesFromPool `json:"addressesFromPool,omitempty"`
 }
 
 ~~~
@@ -210,7 +252,6 @@ kind: Machine
 metadata:
   name: test-compute-1
 spec:
-  lifecycleHooks: {}
   metadata: {}
   providerSpec:
     value:
@@ -255,24 +296,19 @@ Additionally, each defined host may optionally define a failure domain.  This in
 
 ##### Machine API
 - Modify vSphere machine controller to convert IP configuration to VM guestinfo parameter
-- Introduce a new lifecycle hook called `preProvision`.
+- Introduce new types to facilitate IP allocation by a controller.
 - Modify [types_vsphereprovider.go](https://github.com/openshift/api/blob/master/machine/v1beta1/types_vsphereprovider.go) to support network device configuration. 
 
 
 ###### network device configuration of Machines
+
+IP configuration for a given network device may be derived from three configuration mechanisms:
+1. DHCP
+2. An IPAM IP Pool
+3. Static IP configuration defined in the provider spec
+
 The machine API `VSphereMachineProviderSpec.Network` will be extended to include a subset of additional properties as defined in https://github.com/kubernetes-sigs/cluster-api-provider-vsphere/blob/main/apis/v1beta1/types.go.  See [openshift/api#1338](https://github.com/openshift/api/pull/1338) for further details on the API extension to the provider specification.  
 
-An additional lifecycle hook will be added to the The `machine.machine.openshift.io` and `machinesets.machine.openshift.io` CRDs to enable a controller to augment a machine resource before it is rendered in the backing infrastructure.
-
-~~~go
-// preProvision hooks prevent the machine from being created in the backing infrastructure.
-// +listType=map
-// +listMapKey=name
-// +optional
-preProvision []LifecycleHook `json:"preProvision,omitempty"`
-~~~
-
-Creation of the resource will be blocked until the `preProvision` hook is removed from the `machine.machine.openshift.io` instance.
 
 ### Workflow Description
 
@@ -287,14 +323,14 @@ Creation of the resource will be blocked until the `preProvision` hook is remove
 
 #### Scaling new Nodes without `machinesets`
 1. OpenShift administrator reserves IP addresses for new nodes to be scaled up.
-2. OpenShift administrator constructs machine resource to define an network device configuration for each new node that will receive a static IP address.
+2. OpenShift administrator constructs machine resource to define a network device configuration for each new node that will receive a static IP address.
 3. OpenShift administrator initiates the creation of new machines by running `oc create -f machine.yaml`.  
 4. The machine API will render the nodes with the specified network device configuration.
 
 #### Scaling new Nodes with `machinesets`
-1. OpenShift administrator configures a machineset with a `preProvision` lifecycle hook.
+1. OpenShift administrator configures a machineset with `addressesFromPools` defined in the platform specification.
 
-Example of a `machineset` configured to configure the `preProvision` lifecycle hook on machines it creates.
+Example:
 ~~~yaml
 apiVersion: machine.openshift.io/v1beta1
 kind: MachineSet
@@ -316,26 +352,38 @@ spec:
         machine.openshift.io/cluster-api-machine-role: worker
         machine.openshift.io/cluster-api-machine-type: worker
         machine.openshift.io/cluster-api-machineset: static-machineset-worker
-    spec:
-      lifecycleHooks:
-        preProvision:
-          - name: ipamController
-            owner: network-admin
+    spec:          
+      cloneMode: linkedClone
+      datacenter: dc0
+      datastore: sharedVmfs-0
+      diskGiB: 25
+      folder: folder0
+      memoryMiB: 8192
+      network:
+        devices:
+        - networkName: port-group-vlan-101
+          # BEGIN NEW CONFIGURATION
+          dhcp4: false                          # SET THIS TO FALSE
+          addressesFromPools:                   # add reference to pool created earlier
+          - apiGroup: machine.openshift.io
+            kind: IPAMClusterIPPool
+            name: example-pool
 ~~~
 
 2. OpenShift administrator or machine autoscaler scales `n` machines
-3. Controller watches machine resources created with the a `preProvision` lifecycle hook which matches
-the expected name/owner.
-4. Controller updates machine providerSpec with network device configuration
-5. Controller sets `preTerminate` lifecycle hook
-6. Controller removes `preProvision` lifecycle hook
+3. If `addressesFromPools` contains a `AddressesFromPool` definition, the machine controller will create an `IPAddressClaim`. The `IPAddressClaim` will:
+- Set a finalizer on the `IPAddressClaim` called `ipam.cluster.x-k8s.io/ip-claim-protection`
+- Set an owner reference to the associated `Machine`
+- Set the status of the associated `Machine`
+- Block the creation of the underlying machine in the infrastructure until all associated `IPAddressClaim`s are bound
+4. An external controller will watch for `IPAddressClaim`s and obtain an IP address in accordance with the `AddressesFromPool` specification.
+5. Once obtained, the external controller will create an `IPAddress` and bind it to its associated `IPAddressClaim`.
+6. The machine controller will create the virtual machine with the network configuration in the network device spec and the `IPAddress`.
 
-On scale down, the controller will recognize a machine is being deleted and check for a `preTerminate`
-lifecycle hook.  If the hook exists, the controller will retrieve the IP address of the machine and 
-release the IP.  It is recommended that if releasing a lease fails that the controller
-retries some number of times before giving up.  However, upon giving up, the controller should remove 
-the `preTerminate` regardless of if the IP address was successfully released to prevent blocking 
-the machine's deletion.
+On scale down:
+1. The machine controller will remove the finalizer an `IPAddressClaim` associated with a given `Machine` after the underlying virtual machine has been deleted.
+2. The kubernetes API will garbage collect the `IPAddressClaim` and `IPAddress` formerly associated with the `Machine`.
+3. Once the `IPAddress` associated with the machine is deleted, the external controller can reuse the address.
 
 In this workflow, the controller is responsible for managing, claiming, and releasing IP addresses.  
 
