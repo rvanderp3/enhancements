@@ -72,8 +72,7 @@ slice will be introduced to the installer platform specification to allow networ
 
 For the bootstrap and control plane nodes, static IP configuration is passed to the node on the [kernel command line](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/networking_guide/sec-configuring_ip_networking_from_the_kernel_command_line) via the `guestinfo.afterburn.initrd.network-kargs` extraconfig parameter.  [Afterburn](https://github.com/coreos/afterburn/blob/main/src/providers/vmware/amd64.rs) recognizes this parameter when the node initially boots. 
 
-When static network device configuration is required, Machines can not be created via MachineSets.
-The installer must create the initial set of compute machines.
+When static network device configuration is required, Machines can not be created via MachineSets without an external controller fulfilling `IPAddressClaim`s. The installer will create the initial compute Machine manifests with the network configuration provided in the platform specification.
 
 As with the installer, the vSphere [machine reconciler](https://github.com/openshift/machine-api-operator/blob/master/pkg/controller/vsphere/reconciler.go#L745-L755) 
 will pass the static network device configuration via the `guestinfo.afterburn.initrd.network-kargs` extraconfig parameter.  
@@ -81,10 +80,11 @@ will pass the static network device configuration via the `guestinfo.afterburn.i
 
 ### Day 2 Static network device configuration
 
-Nodes being added to a cluster may be configured with a network device configuration or default to DHCP.  The networking configuration of a node/machine is immutable after creation. The vSphere machine API machine controller will apply the network device configuration when the associated VM is cloned.
+CAPI has introduced CRDs [IPAddressClaims](https://github.com/kubernetes-sigs/cluster-api/blob/main/config/crd/bases/ipam.cluster.x-k8s.io_ipaddressclaims.yaml) and [IPAddresses](https://github.com/kubernetes-sigs/cluster-api/blob/main/config/crd/bases/ipam.cluster.x-k8s.io_ipaddresses.yaml).  An implementation of IPAM support has merged in [CAPV](https://github.com/kubernetes-sigs/cluster-api-provider-vsphere/pull/1666).  The CAPV implementation relies upon experimental APIs but is available for use with workload clusters.
 
-`machinesets` will be supported through the creation of a user-created custom controller([sample controller](https://github.com/rvanderp3/machine-ipam-controller)).  This custom controller will leverage machine lifecycle hooks to
-provide network device configuration to machines descending from `machinesets` with `machine` annotated with the appropriate lifecycle hook.
+ for Nodes being added to a cluster may be configured with a network device configuration or default to DHCP.  The network configuration of a node/machine is immutable after creation. The vSphere machine API machine controller will apply the network device configuration when the associated VM is cloned.
+
+`machinesets` will be supported through the creation of a user-created custom controller([sample controller](https://github.com/rvanderp3/machine-ipam-controller)).  
 
 #### Changes Required
 
@@ -92,6 +92,25 @@ provide network device configuration to machines descending from `machinesets` w
 
 1. Modify the `install-config.yaml` vSphere platform specification to support the definition of the 
 ~~~go
+
+const (
+	// IPAddressClaimedCondition documents the status of claiming an IP address
+	// from an IPAM provider.
+	IPAddressClaimedCondition clusterv1.ConditionType = "IPAddressClaimed"
+
+	// WaitingForIPAddressReason (Severity=Info) documents that the VSphereVM is
+	// currently waiting for an IP address to be provisioned.
+	WaitingForIPAddressReason = "WaitingForIPAddress"
+
+	// IPAddressInvalidReason (Severity=Error) documents that the IP address
+	// provided by the IPAM provider is not valid.
+	IPAddressInvalidReason = "IPAddressInvalid"
+
+  // IPClaimFinalizer allows the reconciler to prevent deletion of an
+	// IPAddressClaim that is in use.
+	IPAddressClaimFinalizer = "vspherevm.infrastructure.cluster.x-k8s.io/ip-claim-protection"
+)
+
 // Hosts defines `Host` configurations to be applied to nodes deployed by the installer
 type Hosts []Host
 
@@ -111,8 +130,37 @@ type Host struct {
   Role string `json: "role"`
 }
 
+type IPPoolRef struct {
+  ApiGroup string `json: "apiGroup"`
+  Kind string `json: "kind"`
+  Name string `json: "name"`
+}
+
+type IPAddressClaim struct {
+ 	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+  PoolRef IPAMClusterIPPoolRef `json: "poolRef"`
+}
+
+type IPAddressClaimRef struct {
+  Name string `json: "name"`
+}
+
+type IPAddress struct {
+  Address string `json: "address"`
+
+  ClaimRef IPAddressClaimRef `json: "claimRef"`
+  
+  Gateway string `json: "gateway"`
+
+  PoolRef IPAMClusterIPPoolRef `json: "poolRef"`
+
+  Prefix int64 `json: "prefix"`
+}
+
 // IPAMClusterIPPoolSpec defines the desired state of IPAMClusterIPPoolSpec.
-type IPAMClusterIPPoolSpec struct {
+type IPPoolSpec struct {
 	// Subnet is the subnet to assign IP addresses from.
 	// +optional
 	Subnet string `json:"subnet,omitempty"`
@@ -120,17 +168,17 @@ type IPAMClusterIPPoolSpec struct {
   FailureDomain string `json:"failure-domain,omitempty"`
 }
 
-// IPAMClusterIPPoolStatus defines the observed state of StubClusterIPPool.
-type IPAMClusterIPPoolStatus struct {
+// IPPoolStatus defines the observed state of StubClusterIPPool.
+type IPPoolStatus struct {
 }
 
 // IPAMClusterIPPool is the Schema for the StubClusterIPPool API.
-type IPAMClusterIPPool struct {
+type IPPool struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-  Spec   IPAMClusterIPPoolSpec   `json:"spec,omitempty"`
-	Status IPAMClusterIPPoolStatus `json:"status,omitempty"`
+  Spec   IPPoolSpec   `json:"spec,omitempty"`
+	Status IPPoolStatus `json:"status,omitempty"`
 }
 
 
@@ -378,27 +426,24 @@ spec:
 - Block the creation of the underlying machine in the infrastructure until all associated `IPAddressClaim`s are bound
 4. An external controller will watch for `IPAddressClaim`s and obtain an IP address in accordance with the `AddressesFromPool` specification.
 5. Once obtained, the external controller will create an `IPAddress` and bind it to its associated `IPAddressClaim`.
-6. The machine controller will create the virtual machine with the network configuration in the network device spec and the `IPAddress`.
+6. The machine controller will then create the virtual machine with the network configuration in the network device spec and the `IPAddress`.
+
+~~~mermaid
+sequenceDiagram
+    machineset controller->>+machine: creates machine with<br> IPAMClusterIPPool
+    machine controller-->machine controller: create IPAddressClaim<br>and wait for claim<br>to be bound
+    machine controller-->machine controller: IPAddressClaim ownerReference<br>refers to the machine
+    IP controller-->IP controller: processes claim and<br>allocates IP address    
+    IP controller-->IP controller: create IPAddress and bind IPAddressClaim
+    machine controller-->machine controller: build guestinfo.afterburn.initrd.network-kargs<br>and clone VM
+~~~
 
 On scale down:
-1. The machine controller will remove the finalizer an `IPAddressClaim` associated with a given `Machine` after the underlying virtual machine has been deleted.
+1. The machine controller will remove the finalizer on `IPAddressClaim` associated with a given `Machine` after the underlying virtual machine has been deleted.
 2. The kubernetes API will garbage collect the `IPAddressClaim` and `IPAddress` formerly associated with the `Machine`.
 3. Once the `IPAddress` associated with the machine is deleted, the external controller can reuse the address.
 
 In this workflow, the controller is responsible for managing, claiming, and releasing IP addresses.  
-
-~~~mermaid
-sequenceDiagram
-    machineset controller->>+machine: creates machine with<br> preProvision hook
-    machine controller-->machine controller: waits for preProvision hook<br>to be removed
-    IP controller-->>+machine: confirm precense of<br>preProvision hook
-    IP controller-->IP controller: allocates IP address
-    IP controller->>+machine: sets network device configuration on machine
-    IP controller->>+machine: removes preProvision hook and<br>sets preTerminate hook
-    machine-->>machine controller: network device configuration read from <br>machine and converted to<br>guestinfo.afterburn.initrd.network-kargs
-    machine controller->>vCenter: creates virtual machine
-~~~
-
 
 A sample project [machine-ipam-controller](https://github.com/rvanderp3/machine-ipam-controller) is an example of a controller that implements this workflow.
 
@@ -424,6 +469,13 @@ machine creation will continue.
 - `install-config.yaml` will grow in complexity.
 
 ## Design Details
+
+
+
+https://cluster-api.sigs.k8s.io/reference/glossary.html#ipam-provider
+https://github.com/kubernetes-sigs/cluster-api-provider-vsphere/pull/1210/files
+
+
 
 ### Open Questions
 
@@ -473,5 +525,7 @@ end to end tests.**
 ## Implementation History
 
 ## Alternatives
+
+Lifecycle hook
 
 ## Infrastructure Needed [optional]
