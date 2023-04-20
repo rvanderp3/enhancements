@@ -80,11 +80,12 @@ will pass the static network device configuration via the `guestinfo.afterburn.i
 
 ### Day 2 Static network device configuration
 
+Machines with static IPs may be added after installation by either manually specifying the network
+configuration in the providerSpec in a manually created `machine` resource, or by defining an `IPPool` in `addressesFromPool` in a `machineset` provider spec.
+
 CAPI has introduced CRDs [IPAddressClaims](https://github.com/kubernetes-sigs/cluster-api/blob/main/config/crd/bases/ipam.cluster.x-k8s.io_ipaddressclaims.yaml) and [IPAddresses](https://github.com/kubernetes-sigs/cluster-api/blob/main/config/crd/bases/ipam.cluster.x-k8s.io_ipaddresses.yaml).  An implementation of IPAM support has merged in [CAPV](https://github.com/kubernetes-sigs/cluster-api-provider-vsphere/pull/1666).  The CAPV implementation relies upon experimental APIs but is available for use with workload clusters.
 
- for Nodes being added to a cluster may be configured with a network device configuration or default to DHCP.  The network configuration of a node/machine is immutable after creation. The vSphere machine API machine controller will apply the network device configuration when the associated VM is cloned.
-
-`machinesets` will be supported through the creation of a user-created custom controller([sample controller](https://github.com/rvanderp3/machine-ipam-controller)).  
+`machinesets` will be supported through the creation of an external controller([sample controller](https://github.com/rvanderp3/machine-ipam-controller)).  
 
 #### Changes Required
 
@@ -352,7 +353,7 @@ Additionally, each defined host may optionally define a failure domain.  This in
 
 IP configuration for a given network device may be derived from three configuration mechanisms:
 1. DHCP
-2. An IPAM IP Pool
+2. An external IPAM IP Pool
 3. Static IP configuration defined in the provider spec
 
 The machine API `VSphereMachineProviderSpec.Network` will be extended to include a subset of additional properties as defined in https://github.com/kubernetes-sigs/cluster-api-provider-vsphere/blob/main/apis/v1beta1/types.go.  See [openshift/api#1338](https://github.com/openshift/api/pull/1338) for further details on the API extension to the provider specification.  
@@ -409,12 +410,11 @@ spec:
       memoryMiB: 8192
       network:
         devices:
-        - networkName: port-group-vlan-101
-          # BEGIN NEW CONFIGURATION
-          dhcp4: false                          # SET THIS TO FALSE
-          addressesFromPools:                   # add reference to pool created earlier
+        - networkName: port-group-vlan-101          
+          dhcp4: false                          
+          addressesFromPools:                   
           - apiGroup: machine.openshift.io
-            kind: IPAMClusterIPPool
+            kind: IPPool
             name: example-pool
 ~~~
 
@@ -430,7 +430,7 @@ spec:
 
 ~~~mermaid
 sequenceDiagram
-    machineset controller->>+machine: creates machine with<br> IPAMClusterIPPool
+    machineset controller->>+machine: creates machine with<br> IPPool
     machine controller-->machine controller: create IPAddressClaim<br>and wait for claim<br>to be bound
     machine controller-->machine controller: IPAddressClaim ownerReference<br>refers to the machine
     IP controller-->IP controller: processes claim and<br>allocates IP address    
@@ -452,9 +452,19 @@ A sample project [machine-ipam-controller](https://github.com/rvanderp3/machine-
 
 ### API Extensions
 
-The CRDs `machines.machine.openshift.io` and `machinesets.machine.openshift.io` will be modified to add a new lifecycle hook called `preProvision`.  When defined, the `preProvision` lifecycle hook will block the rendering of a machine in it's backing infrastructure.
+3 additional CRDs will be introduced which to `machine.openshift.io`.
 
-### Implementation Details/Notes/Constraints [optional]
+- `ippool.machine.openshift.io` - IP pool which is fulfilled by an external controller
+- `ipaddressclaim.machine.openshift.io` - IP address claim request which is created by the machine reconciler and fulfilled by an external controller
+- `ipaddress.machine.openshift.io` - IP address fulfilled by an external controller
+
+The CRDs `machines.machine.openshift.io` and `machinesets.machine.openshift.io` will be modified to allow the definition of `addressesFromPool` in the provider specification.
+
+### Implementation Details/Notes/Constraints 
+
+#### Eventual Migration to CAPI/CAPV
+
+The definition of the CRDs above is intended to follow a similar pattern followed by [CAPV](https://github.com/kubernetes-sigs/cluster-api-provider-vsphere/pull/1210/files).  Migration would consist of migrating the `ipaddressclaim.machine.openshift.io` and `ipaddress.machine.openshift.io` CRDs to the analogous CAPI CRDs.
 
 ### Risks and Mitigations
 
@@ -463,17 +473,13 @@ The CRDs `machines.machine.openshift.io` and `machinesets.machine.openshift.io` 
 - Scaling nodes will become more complex. This will require the OpenShift administrator to integrate network device configuration
   management to enable scaling of machine API machine resources.
 
-- If a `machineset` is configured to specify the `preProvision` lifecycle hook, a controller must remove the hook before
-machine creation will continue.
+- If a `machineset` is configured to specify an IPPool resource.  An external controller is responsible for fulfilling the resultant `IPAddressClaim` that is created during machine rendering.
 
 - `install-config.yaml` will grow in complexity.
 
 ## Design Details
 
 
-
-https://cluster-api.sigs.k8s.io/reference/glossary.html#ipam-provider
-https://github.com/kubernetes-sigs/cluster-api-provider-vsphere/pull/1210/files
 
 
 
@@ -526,6 +532,6 @@ end to end tests.**
 
 ## Alternatives
 
-Lifecycle hook
+Lifecycle hook 
 
 ## Infrastructure Needed [optional]
